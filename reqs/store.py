@@ -217,7 +217,16 @@ class StoreClient(object):
     # ' \
     # https://p25-buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/volumeStoreDownloadProduct?guid=000C2941396Bk
     def volumeStoreDownloadProduct(self, appId, appVerId=""):
-        req = StoreDownloadReq(creditDisplay="", guid=self.authInfo.guid, salableAdamId=appId, externalVersionId=appVerId)
+        # NOTE:
+        # Some accounts/apps will fail with failureType=5002 if we explicitly send
+        # an empty externalVersionId (""). Keep it absent unless caller provides
+        # a concrete version id.
+        req = StoreDownloadReq(
+            creditDisplay="",
+            guid=self.authInfo.guid,
+            salableAdamId=appId,
+            externalVersionId=appVerId or None,
+        )
         hdrs = {
                "Content-Type": "application/x-www-form-urlencoded",
                "User-Agent": CONFIGURATOR_UA,
