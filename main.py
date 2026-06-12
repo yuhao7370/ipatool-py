@@ -294,7 +294,7 @@ class IPATool(object):
                         f.write(Store.authenticate_save_session())
 
             def authedPost(*args, **kwargs):
-                if 'MZFinance.woa/wa/authenticate' in args[0]:
+                if 'MZFinance.woa/wa/authenticate' in args[0] or 'auth.itunes.apple.com/auth/' in args[0]:
                     return Store.sess.original_post(*args, **kwargs)
                 for i in range(3):
                     r = Store.sess.original_post(*args, **kwargs)

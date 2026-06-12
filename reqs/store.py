@@ -3,6 +3,8 @@ import json
 import pickle
 import plistlib
 import re
+from urllib.parse import urljoin
+
 import requests
 from reqs.schemas.store_authenticate_resp import StoreAuthenticateResp
 from reqs.schemas.store_buyproduct_req import StoreBuyproductReq
@@ -21,13 +23,13 @@ class StoreException(Exception):
             "Store %s error: %s, errorType: %s" % (self.req, self.errMsg, self.errType)
         )
 
-#CONFIGURATOR_UA = "Configurator/2.0 (Macintosh; OS X 10.12.6; 16G29) AppleWebKit/2603.3.8"
-CONFIGURATOR_UA = 'Configurator/2.0 (Macintosh; OS X 10.12.6; 16G29) AppleWebKit/2603.3.8 iOS/14.2 hwp/t8020'
+CONFIGURATOR_UA = "Configurator/2.17 (Macintosh; OS X 15.2; 24C5089c) AppleWebKit/0620.1.16.11.6"
 LEGACY_AUTH_ENDPOINT = "https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate"
 INIT_BAG_ENDPOINT = "https://init.itunes.apple.com/bag.xml?guid=%s"
 APPSTORE_HOST = "buy.itunes.apple.com"
 APPSTORE_DOWNLOAD_PATH = "/WebObjects/MZFinance.woa/wa/volumeStoreDownloadProduct"
 APPSTORE_PURCHASE_PATH = "/WebObjects/MZFinance.woa/wa/buyProduct"
+RETRY_AUTH_ERROR_TYPES = {"empty_response", "invalid_plist"}
 
 DOCUMENT_XML_PATTERN = re.compile(br'(?is)<Document\b[^>]*>(.*)</Document>')
 PLIST_XML_PATTERN = re.compile(br'(?is)<plist\b[^>]*>.*?</plist>')
@@ -66,6 +68,48 @@ def parse_plist_payload(body: bytes):
         if normalized != body:
             return plistlib.loads(normalized)
         raise
+
+def _response_preview(body: bytes, limit: int = 300) -> str:
+    if not body:
+        return ""
+    return body[:limit].decode("utf-8", errors="replace").replace("\r", "\\r").replace("\n", "\\n")
+
+def _response_summary(resp: requests.Response) -> dict:
+    header_names = (
+        "content-type",
+        "location",
+        "apple-originating-system",
+        "x-apple-request-uuid",
+        "x-apple-jingle-correlation-key",
+        "x-set-apple-store-front",
+        "pod",
+        "itspod",
+    )
+    return {
+        "status_code": resp.status_code,
+        "url": resp.url,
+        "headers": {
+            name: resp.headers.get(name)
+            for name in header_names
+            if resp.headers.get(name) is not None
+        },
+        "body_preview": _response_preview(resp.content),
+    }
+
+def _parse_plist_response(req_name: str, resp: requests.Response):
+    if resp.status_code == 429:
+        raise StoreException(req_name, _response_summary(resp), "rate limited by Apple", "http_429")
+    if not resp.content.strip():
+        raise StoreException(req_name, _response_summary(resp), "empty response from Apple Store", "empty_response")
+    try:
+        return parse_plist_payload(resp.content)
+    except Exception as exc:
+        raise StoreException(
+            req_name,
+            _response_summary(resp),
+            "non-plist response from Apple Store: %s" % exc,
+            "invalid_plist",
+        )
 
 class StoreClientAuth(object):
     def __init__(self, appleId=None, password=None):
@@ -121,43 +165,105 @@ class StoreClientAuth(object):
             pass
         return LEGACY_AUTH_ENDPOINT
 
+    def _auth_endpoint_candidates(self, endpoint):
+        candidates = []
+        for item in (
+            endpoint,
+            endpoint.rstrip("/") + "/fast" if "auth.itunes.apple.com/auth/v1/native" in endpoint else None,
+            "%s?guid=%s" % (endpoint.rstrip("/") + "/fast", self.guid)
+            if "auth.itunes.apple.com/auth/v1/native" in endpoint
+            else None,
+            "%s?guid=%s" % (LEGACY_AUTH_ENDPOINT, self.guid),
+            LEGACY_AUTH_ENDPOINT,
+        ):
+            if item and item not in candidates:
+                candidates.append(item)
+        return candidates
+
+    def _apply_login_response(self, resp, http_resp, sess):
+        dsid = None
+        if resp.download_queue_info and resp.download_queue_info.dsid:
+            dsid = str(resp.download_queue_info.dsid)
+        elif resp.dsPersonId:
+            dsid = str(resp.dsPersonId)
+
+        if not resp.passwordToken or not dsid:
+            raise StoreException(
+                "authenticate",
+                resp.as_dict(),
+                resp.customerMessage or "Apple authentication did not return credentials",
+                resp.failureType,
+            )
+
+        self.authHeaders = {}
+        self.authHeaders['X-Dsid'] = self.authHeaders['iCloud-Dsid'] = dsid
+        store_front = http_resp.headers.get('x-set-apple-store-front')
+        if store_front:
+            self.authHeaders['X-Apple-Store-Front'] = store_front
+        self.authHeaders['X-Token'] = resp.passwordToken
+        self.pod = http_resp.headers.get('pod') or http_resp.headers.get('itspod')
+        self.authCookies = pickle.dumps(sess.cookies).hex()
+
+        accountInfo = resp.accountInfo
+        if accountInfo and accountInfo.address:
+            self.accountName = (accountInfo.address.firstName + " " + accountInfo.address.lastName).strip()
+        else:
+            self.accountName = accountInfo.appleId if accountInfo else ""
+
     def login(self, sess):
         if not self.guid:
             self.guid = self._generateGuid(self.appleId)
 
-        req = {
-            "appleId": self.appleId,
-            "password": self.password,
-            "attempt": "4",
-            "guid": self.guid,
-            "rmp": "0",
-            "why": "signIn",
-        }
-        url = self._resolve_auth_endpoint(sess)
-        while True:
-            r = sess.post(url,
-                               headers={
-                                   "Accept": "*/*",
-                                   "Content-Type": "application/x-www-form-urlencoded",
-                                   "User-Agent": CONFIGURATOR_UA,
-                               }, data=plistlib.dumps(req), allow_redirects=False)
-            if r.status_code == 302:
-                url = r.headers['Location']
-                continue
-            break
-        d = parse_plist_payload(r.content)
-        resp = StoreAuthenticateResp.from_dict(d)
-        if not resp.m_allowed:
-            raise StoreException("authenticate", d, resp.customerMessage, resp.failureType)
+        last_parse_error = None
+        for endpoint in self._auth_endpoint_candidates(self._resolve_auth_endpoint(sess)):
+            url = endpoint
+            for attempt in range(1, 5):
+                req = {
+                    "appleId": self.appleId,
+                    "password": self.password,
+                    "attempt": str(attempt),
+                    "guid": self.guid,
+                    "rmp": "0",
+                    "why": "signIn",
+                }
+                while True:
+                    r = sess.post(url,
+                                  headers={
+                                      "Accept": "*/*",
+                                      "Content-Type": "application/x-www-form-urlencoded",
+                                      "User-Agent": CONFIGURATOR_UA,
+                                  }, data=plistlib.dumps(req), allow_redirects=False)
+                    if r.status_code in (301, 302, 303, 307, 308) and r.headers.get('Location'):
+                        url = urljoin(url, r.headers['Location'])
+                        continue
+                    break
 
-        self.authHeaders = {}
-        self.authHeaders['X-Dsid'] = self.authHeaders['iCloud-Dsid'] = str(resp.download_queue_info.dsid)
-        self.authHeaders['X-Apple-Store-Front'] = r.headers.get('x-set-apple-store-front')
-        self.authHeaders['X-Token'] = resp.passwordToken
-        self.pod = r.headers.get('pod')
-        self.authCookies = pickle.dumps(sess.cookies).hex()
+                try:
+                    d = _parse_plist_response("authenticate", r)
+                except StoreException as exc:
+                    if exc.errType in RETRY_AUTH_ERROR_TYPES:
+                        last_parse_error = exc
+                        break
+                    raise
 
-        self.accountName = resp.accountInfo.address.firstName + " " + resp.accountInfo.address.lastName
+                resp = StoreAuthenticateResp.from_dict(d)
+                if resp.passwordToken and (resp.dsPersonId or resp.download_queue_info):
+                    self._apply_login_response(resp, r, sess)
+                    return
+
+                if resp.failureType == "-5000" and attempt == 1:
+                    continue
+
+                raise StoreException(
+                    "authenticate",
+                    d,
+                    resp.customerMessage or "Apple authentication failed",
+                    resp.failureType,
+                )
+
+        if last_parse_error:
+            raise last_parse_error
+        raise StoreException("authenticate", None, "Apple authentication failed")
     def save(self):
         return json.dumps(self.__dict__)
 
@@ -236,7 +342,7 @@ class StoreClient(object):
         r = self.sess.post(url,
                            headers=hdrs,
                            data=plistlib.dumps(payload))
-        d = parse_plist_payload(r.content)
+        d = _parse_plist_response("volumeStoreDownloadProduct", r)
         resp = StoreDownloadResp.from_dict(d)
         if resp.cancel_purchase_batch:
             raise StoreException("volumeStoreDownloadProduct", d, resp.customerMessage, '%s-%s' % (resp.failureType, resp.metrics))
@@ -286,7 +392,7 @@ class StoreClient(object):
                         data=plistlib.dumps(payload)
                         )
 
-        d = parse_plist_payload(r.content)
+        d = _parse_plist_response("buyProduct", r)
         resp = StoreBuyproductResp.from_dict(d)
         if resp.cancel_purchase_batch:
             raise StoreException("buyProduct", d, resp.customerMessage, '%s-%s' % (resp.failureType, resp.metrics))
@@ -320,7 +426,7 @@ class StoreClient(object):
         if r.status_code == 500:
             raise StoreException("buyProduct_purchase", None, 'purchased_before')
 
-        d = parse_plist_payload(r.content)
+        d = _parse_plist_response("buyProduct_purchase", r)
         resp = StoreBuyproductResp.from_dict(d)
         if resp.status != 0 or resp.jingleDocType != 'purchaseSuccess':
             raise StoreException("buyProduct_purchase", d, resp.customerMessage,
