@@ -25,11 +25,13 @@ class StoreException(Exception):
 
 CONFIGURATOR_UA = "Configurator/2.17 (Macintosh; OS X 15.2; 24C5089c) AppleWebKit/0620.1.16.11.6"
 LEGACY_AUTH_ENDPOINT = "https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate"
+AUTH_ENDPOINT = "https://auth.itunes.apple.com/auth/v1/native/fast/"
 INIT_BAG_ENDPOINT = "https://init.itunes.apple.com/bag.xml?guid=%s"
 APPSTORE_HOST = "buy.itunes.apple.com"
 APPSTORE_DOWNLOAD_PATH = "/WebObjects/MZFinance.woa/wa/volumeStoreDownloadProduct"
 APPSTORE_PURCHASE_PATH = "/WebObjects/MZFinance.woa/wa/buyProduct"
 RETRY_AUTH_ERROR_TYPES = {"empty_response", "invalid_plist"}
+CUSTOMER_MESSAGE_ACTION_SIGN_IN_PAGE = "AMD-Action::SP"
 
 DOCUMENT_XML_PATTERN = re.compile(br'(?is)<Document\b[^>]*>(.*)</Document>')
 PLIST_XML_PATTERN = re.compile(br'(?is)<plist\b[^>]*>.*?</plist>')
@@ -111,6 +113,16 @@ def _parse_plist_response(req_name: str, resp: requests.Response):
             "invalid_plist",
         )
 
+def _normalize_auth_endpoint(endpoint: str) -> str:
+    if not endpoint:
+        return AUTH_ENDPOINT
+    if "auth.itunes.apple.com" in endpoint:
+        endpoint = endpoint.rstrip("/")
+        if not endpoint.endswith("/fast"):
+            endpoint += "/fast"
+        endpoint += "/"
+    return endpoint
+
 class StoreClientAuth(object):
     def __init__(self, appleId=None, password=None):
         self.appleId = appleId
@@ -156,23 +168,22 @@ class StoreClientAuth(object):
             r.raise_for_status()
             d = parse_plist_payload(r.content)
             if isinstance(d, dict):
-                urlBag = d.get('urlBag')
-                if isinstance(urlBag, dict):
-                    endpoint = urlBag.get('authenticateAccount')
-                    if endpoint:
-                        return endpoint
+                endpoint = d.get('authenticateAccount')
+                if not endpoint:
+                    urlBag = d.get('urlBag')
+                    if isinstance(urlBag, dict):
+                        endpoint = urlBag.get('authenticateAccount')
+                if endpoint:
+                    return _normalize_auth_endpoint(endpoint)
         except Exception:
             pass
-        return LEGACY_AUTH_ENDPOINT
+        return AUTH_ENDPOINT
 
     def _auth_endpoint_candidates(self, endpoint):
         candidates = []
         for item in (
-            endpoint,
-            endpoint.rstrip("/") + "/fast" if "auth.itunes.apple.com/auth/v1/native" in endpoint else None,
-            "%s?guid=%s" % (endpoint.rstrip("/") + "/fast", self.guid)
-            if "auth.itunes.apple.com/auth/v1/native" in endpoint
-            else None,
+            _normalize_auth_endpoint(endpoint),
+            AUTH_ENDPOINT,
             "%s?guid=%s" % (LEGACY_AUTH_ENDPOINT, self.guid),
             LEGACY_AUTH_ENDPOINT,
         ):
@@ -253,6 +264,14 @@ class StoreClientAuth(object):
 
                 if resp.failureType == "-5000" and attempt == 1:
                     continue
+
+                if resp.customerMessage == CUSTOMER_MESSAGE_ACTION_SIGN_IN_PAGE:
+                    raise StoreException(
+                        "authenticate",
+                        d,
+                        "account requires browser sign-in (2FA or Apple ID review required)",
+                        resp.failureType,
+                    )
 
                 raise StoreException(
                     "authenticate",
